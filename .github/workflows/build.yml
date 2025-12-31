@@ -1,0 +1,248 @@
+name: Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs_on:
+        required: false
+        default: 'ubuntu-latest'
+      repo_owner:
+        required: true
+      repo_name:
+        required: true
+      branch:
+        required: true
+        default: 'main'
+      commands:
+        required: true
+        default: 'bun run build'
+      output_paths:
+        required: true
+        default: 'dist'
+      env_vars:
+        required: false
+      callback_url:
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  SALT: ${{ secrets.SALT }}
+  GITLAB_URL: ${{ secrets.GITLAB_URL }}
+  GITLAB_USERNAME: ${{ secrets.GITLAB_USERNAME }}
+  GITLAB_PASSWORD: ${{ secrets.GITLAB_PASSWORD }}
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
+
+    steps:
+    - name: 检出工作流仓库
+      uses: actions/checkout@v4
+
+    - name: 记录开始时间
+      run: |
+        echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+
+    - name: 安装 Bun
+      uses: oven-sh/setup-bun@v1
+      with:
+        bun-version: latest
+
+    - name: 安装 Rust
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: 初始化工作环境
+      run: |
+        set -euo pipefail
+
+        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
+          sudo apt-get -qq update 2>/dev/null || true
+          sudo apt-get -qq install -y jq zip >/dev/null 2>&1 || true
+        elif [[ "$OSTYPE" == "darwin"* ]]; then
+          command -v jq &>/dev/null || brew install jq >/dev/null 2>&1 || true
+          command -v zip &>/dev/null || brew install zip >/dev/null 2>&1 || true
+        elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
+          command -v jq &>/dev/null || choco install jq -y >/dev/null 2>&1 || true
+        fi
+
+        bun add crypto-js child_process
+
+    - name: 回调（开始 running）
+      if: ${{ inputs.callback_url != '' }}
+      env:
+        CALLBACK_URL: ${{ inputs.callback_url }}
+      run: |
+        URL=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
+        echo "::add-mask::${URL}"
+        curl -sS -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -X POST "${URL}" \
+          --data '{"status":"running"}' >/dev/null || true
+
+    - name: 克隆目标项目
+      shell: bash
+      env:
+        REPO_OWNER: ${{ inputs.repo_owner }}
+        REPO_NAME: ${{ inputs.repo_name }}
+        BRANCH: ${{ inputs.branch }}
+      run: |
+        set -euo pipefail
+
+        [ -n "${GITLAB_URL:-}" ] && echo "::add-mask::${GITLAB_URL}"
+        [ -n "${GITLAB_USERNAME:-}" ] && echo "::add-mask::${GITLAB_USERNAME}"
+        [ -n "${GITLAB_PASSWORD:-}" ] && echo "::add-mask::${GITLAB_PASSWORD}"
+
+        git config --global user.name "GitHub Actions"
+        git config --global user.email "actions@github.com"
+
+        GITLAB_BASE="${GITLAB_URL:-https://gitlab.com}"
+        GITLAB_USER="${GITLAB_USERNAME:-oauth2}"
+        GITLAB_PASS="${GITLAB_PASSWORD:-}"
+
+        GITLAB_HOST="${GITLAB_BASE#https://}"
+        if [ -n "${GITLAB_PASS}" ]; then
+          REPO_URL="https://${GITLAB_USER}:${GITLAB_PASS}@${GITLAB_HOST}/${REPO_OWNER}/${REPO_NAME}.git"
+        else
+          REPO_URL="${GITLAB_BASE}/${REPO_OWNER}/${REPO_NAME}.git"
+        fi
+
+        git clone -q --branch "${BRANCH}" "${REPO_URL}" target-project
+
+    - name: 安装依赖
+      working-directory: target-project
+      run: bun install
+
+    - name: 配置项目环境
+      if: ${{ inputs.env_vars != '' }}
+      working-directory: target-project
+      shell: bash
+      env:
+        ENCRYPTED_ENV: ${{ inputs.env_vars }}
+      run: |
+        set -euo pipefail
+        ENV_FILE=".env"
+        TMP=$(mktemp)
+        bun "$GITHUB_WORKSPACE/.github/workflows/decrypt-env.ts" "${ENCRYPTED_ENV}" "${SALT:-}" "$TMP"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+          [[ -z "$line" || "$line" =~ ^# ]] && continue
+          if [[ "$line" == *=* ]]; then
+            k="${line%%=*}"; v="${line#*=}"
+            scrub="${v%\"}"; scrub="${scrub#\"}"; scrub="${scrub%\'}"; scrub="${scrub#\'}"
+            [[ -n "$scrub" ]] && echo "::add-mask::$scrub"
+            printf '%s=%s\n' "$k" "$v" >> "$GITHUB_ENV"
+          fi
+        done < "$TMP"
+        cp "$TMP" "$ENV_FILE"
+        rm -f "$TMP"
+
+    - name: 执行命令
+      working-directory: target-project
+      shell: bash
+      run: |
+        set -euo pipefail
+        BASE=$(pwd)
+        CMDS=$(printf '%s' "${{ inputs.commands }}" | tr -d '\r')
+        IFS=';' read -ra ARR <<< "$CMDS"
+        for cmd in "${ARR[@]}"; do
+          cmd="$(echo "$cmd" | xargs)"; [ -z "$cmd" ] && continue
+          cd "$BASE" && bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd" "$BASE"
+        done
+
+    - name: 汇总输出
+      working-directory: target-project
+      shell: bash
+      run: |
+        set -euo pipefail
+        TS=$(date +"%Y%m%d-%H%M%S")
+        ZIP_NAME="build-$TS"
+        ZIP_FILE="$ZIP_NAME.zip"
+
+        RAW=$(printf '%s' "${{ inputs.output_paths }}" | tr -d '\r')
+        IFS=';' read -ra PATHS <<< "$RAW"
+        readarray -t PTHS < <(for p in "${PATHS[@]}"; do echo "$p" | xargs; done | sed '/^$/d')
+        if [ "${#PTHS[@]}" -eq 0 ]; then
+          echo "未提供有效输出路径" >&2
+          exit 1
+        fi
+
+        for p in "${PTHS[@]}"; do
+          if [ -d "$p" ]; then
+            (cd "$(dirname "$p")" && zip -r "$OLDPWD/$ZIP_FILE" "$(basename "$p")" >/dev/null)
+          elif [ -f "$p" ]; then
+            zip -j "$ZIP_FILE" "$p" >/dev/null 2>/dev/null || zip "$ZIP_FILE" "$p" >/dev/null
+          fi
+        done
+
+        if command -v stat >/dev/null 2>&1; then
+          SIZE=$(stat -c%s "$ZIP_FILE" 2>/dev/null || stat -f%z "$ZIP_FILE" 2>/dev/null || wc -c <"$ZIP_FILE")
+        else
+          SIZE=$(wc -c <"$ZIP_FILE")
+        fi
+        echo "ARTIFACT_NAME=$ZIP_NAME" >> $GITHUB_ENV
+        echo "ARTIFACT_PATH=$ZIP_FILE" >> $GITHUB_ENV
+        echo "ARTIFACT_SIZE=$SIZE" >> $GITHUB_ENV
+
+    - name: 上传产物
+      id: upload_art
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ARTIFACT_NAME }}
+        path: target-project/${{ env.ARTIFACT_PATH }}
+        if-no-files-found: error
+
+    - name: 回调
+      if: ${{ always() && inputs.callback_url != '' }}
+      shell: bash
+      env:
+        OWNER: ${{ github.repository_owner }}
+        REPO: ${{ github.event.repository.name }}
+        RUN_ID: ${{ github.run_id }}
+        CALLBACK_URL: ${{ inputs.callback_url }}
+      run: |
+        set -euo pipefail
+
+        case "${{ job.status }}" in
+          success) STATUS="success" ;;
+          failure) STATUS="failed" ;;
+          cancelled) STATUS="cancelled" ;;
+          *) STATUS="failed" ;;
+        esac
+
+        RUN_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
+        ART_ID="${{ steps.upload_art.outputs.artifact-id }}"
+        ART_URL="${{ steps.upload_art.outputs.artifact-url }}"
+
+        DOWNLOAD_URL=""
+        [ -n "$ART_ID" ] && DOWNLOAD_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts/${ART_ID}"
+
+        artifacts=$(jq -n \
+          --arg id "${ART_ID:-0}" \
+          --arg name "${{ env.ARTIFACT_NAME }}" \
+          --arg size "${{ env.ARTIFACT_SIZE }}" \
+          --arg arch "${ART_URL:-}" \
+          --arg down "${DOWNLOAD_URL}" \
+          '[{
+            id: ($id|tonumber),
+            name: $name,
+            size_in_bytes: ($size|tonumber),
+            archive_url: $arch,
+            download_url: $down
+          }]')
+
+        CB=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
+        echo "::add-mask::${CB}"
+
+        payload=$(jq -n \
+          --arg status "$STATUS" \
+          --arg run_url "$RUN_URL" \
+          --argjson artifacts "$artifacts" \
+          '{status: $status, github_run_url: $run_url, artifacts: $artifacts}')
+
+        curl -sS -w "%{http_code}" \
+          -H "Content-Type: application/json" \
+          -X POST "${CB}" \
+          --data "$payload" >/dev/null || true
