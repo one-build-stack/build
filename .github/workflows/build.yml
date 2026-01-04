@@ -135,12 +135,23 @@ jobs:
     - name: 获取上传 R2 的 Signed URL
       id: get_upload_url
       run: |
-        FILE_NAME="${{ env.ARTIFACT_NAME }}.zip"
-        CALLBACK_URL="${{ secrets.WORKER_API_URL }}/upload" # 通过 Secrets 引用 Worker API 地址
-        UPLOAD_URL=$(curl -s -X POST "${CALLBACK_URL}" \
+        FILE_NAME=".zip"
+        CALLBACK_URL="${WORKER_API_URL}/upload"
+        
+        RESPONSE=$(curl -sS -X POST "$CALLBACK_URL" \
           -H "Content-Type: application/json" \
-          --data '{"filename": "'$FILE_NAME'", "action": "upload"}' | jq -r .uploadUrl)
-        echo "UPLOAD_URL=$UPLOAD_URL" >> $GITHUB_ENV
+          -d "$(jq -n --arg filename "$FILE_NAME" '{filename: $filename}')")
+        
+        echo "Worker response: $RESPONSE"
+        
+        UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.uploadUrl')
+        
+        if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
+          echo "❌ Failed to get uploadUrl"
+          exit 1
+        fi
+        
+        echo "UPLOAD_URL=$UPLOAD_URL" >> "$GITHUB_ENV"
 
     - name: 上传文件到 R2
       run: |
