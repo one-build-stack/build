@@ -40,13 +40,22 @@ jobs:
     runs-on: ${{ inputs.runs_on || 'ubuntu-latest' }}
 
     steps:
+    # ========================
+    # Checkout workflow repo
+    # ========================
     - name: 检出工作流仓库
       uses: actions/checkout@v4
 
+    # ========================
+    # Record start time
+    # ========================
     - name: 记录开始时间
       run: |
         echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
+    # ========================
+    # Toolchains
+    # ========================
     - name: 安装 Bun
       uses: oven-sh/setup-bun@v1
       with:
@@ -55,6 +64,9 @@ jobs:
     - name: 安装 Rust
       uses: dtolnay/rust-toolchain@stable
 
+    # ========================
+    # Init environment
+    # ========================
     - name: 初始化工作环境
       run: |
         set -euo pipefail
@@ -64,11 +76,12 @@ jobs:
         elif [[ "$OSTYPE" == "darwin"* ]]; then
           command -v jq &>/dev/null || brew install jq >/dev/null 2>&1 || true
           command -v zip &>/dev/null || brew install zip >/dev/null 2>&1 || true
-        elif [[ "$OSTYPE" == "msys" || "$OSTYPE" == "cygwin" || "$OSTYPE" == "win32" ]]; then
-          command -v jq &>/dev/null || choco install jq -y >/dev/null 2>&1 || true
         fi
         bun add crypto-js child_process
 
+    # ========================
+    # Callback: running
+    # ========================
     - name: 回调（开始 running）
       if: ${{ inputs.callback_url != '' }}
       env:
@@ -76,11 +89,14 @@ jobs:
       run: |
         URL=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
         echo "::add-mask::${URL}"
-        curl -sS -w "%{http_code}" \
+        curl -sS \
           -H "Content-Type: application/json" \
           -X POST "${URL}" \
           --data '{"status":"running"}' >/dev/null || true
 
+    # ========================
+    # Clone target project
+    # ========================
     - name: 克隆目标项目
       shell: bash
       env:
@@ -91,17 +107,25 @@ jobs:
         set -euo pipefail
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
+
         GITLAB_BASE="${GITLAB_URL:-https://gitlab.com}"
         GITLAB_USER="${GITLAB_USERNAME:-oauth2}"
         GITLAB_PASS="${GITLAB_PASSWORD:-}"
         GITLAB_HOST="${GITLAB_BASE#https://}"
+
         REPO_URL="https://${GITLAB_USER}:${GITLAB_PASS}@${GITLAB_HOST}/${REPO_OWNER}/${REPO_NAME}.git"
         git clone -q --branch "${BRANCH}" "${REPO_URL}" target-project
 
+    # ========================
+    # Install deps
+    # ========================
     - name: 安装依赖
       working-directory: target-project
       run: bun install
 
+    # ========================
+    # Run build commands
+    # ========================
     - name: 执行命令
       working-directory: target-project
       shell: bash
@@ -110,62 +134,72 @@ jobs:
         CMDS=$(printf '%s' "${{ inputs.commands }}" | tr -d '\r')
         IFS=';' read -ra ARR <<< "$CMDS"
         for cmd in "${ARR[@]}"; do
-          cmd="$(echo "$cmd" | xargs)"; [ -z "$cmd" ] && continue
+          cmd="$(echo "$cmd" | xargs)"
+          [ -z "$cmd" ] && continue
           bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd"
         done
 
-    - name: 汇总输出
+    # ========================
+    # Zip outputs
+    # ========================
+    - name: 汇总输出并打包
       working-directory: target-project
       shell: bash
       run: |
         set -euo pipefail
         TS=$(date +"%Y%m%d-%H%M%S")
-        ZIP_NAME="build-$TS"
-        ZIP_FILE="$ZIP_NAME.zip"
+        ZIP_FILE="build-${TS}.zip"
+
         RAW=$(printf '%s' "${{ inputs.output_paths }}" | tr -d '\r')
         IFS=';' read -ra PATHS <<< "$RAW"
+
         for p in "${PATHS[@]}"; do
           if [ -d "$p" ]; then
             (cd "$(dirname "$p")" && zip -r "$OLDPWD/$ZIP_FILE" "$(basename "$p")" >/dev/null)
           elif [ -f "$p" ]; then
-            zip -j "$ZIP_FILE" "$p" >/dev/null 2>/dev/null || zip "$ZIP_FILE" "$p" >/dev/null
+            zip -j "$ZIP_FILE" "$p" >/dev/null
           fi
         done
 
-    - name: 获取上传 R2 的 Signed URL
-      id: get_upload_url
+        echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
+
+    # ========================
+    # Upload to R2 via Worker
+    # ========================
+    - name: 上传构建产物到 R2（Worker 代理）
+      shell: bash
       run: |
-        FILE_NAME=".zip"
-        CALLBACK_URL="${WORKER_API_URL}/upload"
-        
-        RESPONSE=$(curl -sS -X POST "$CALLBACK_URL" \
-          -H "Content-Type: application/json" \
-          -d "$(jq -n --arg filename "$FILE_NAME" '{filename: $filename}')")
-        
+        set -euo pipefail
+
+        ZIP_FILE="${ZIP_FILE}"
+        echo "Uploading ${ZIP_FILE} ..."
+
+        RESPONSE=$(curl -sS -X POST "${WORKER_API_URL}/upload" \
+          -F "file=@${ZIP_FILE}")
+
         echo "Worker response: $RESPONSE"
-        
-        UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.uploadUrl')
-        
-        if [ -z "$UPLOAD_URL" ] || [ "$UPLOAD_URL" = "null" ]; then
-          echo "❌ Failed to get uploadUrl"
+
+        KEY=$(echo "$RESPONSE" | jq -r '.key')
+
+        if [ -z "$KEY" ] || [ "$KEY" = "null" ]; then
+          echo "❌ Upload failed"
           exit 1
         fi
-        
-        echo "UPLOAD_URL=$UPLOAD_URL" >> "$GITHUB_ENV"
 
-    - name: 上传文件到 R2
+        echo "ARTIFACT_KEY=$KEY" >> "$GITHUB_ENV"
+
+    # ========================
+    # Build download URL
+    # ========================
+    - name: 构造下载地址
+      shell: bash
       run: |
-        ARTIFACT_PATH="${{ env.ARTIFACT_PATH }}"
-        echo "Uploading $ARTIFACT_PATH to R2..."
-        curl -X PUT -T "$ARTIFACT_PATH" "$UPLOAD_URL"
+        DOWNLOAD_URL="${WORKER_API_URL}/download?key=${ARTIFACT_KEY}"
+        echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> "$GITHUB_ENV"
 
-    - name: 获取下载 R2 的 Signed URL
-      id: get_download_url
-      run: |
-        FILE_KEY="${{ env.ARTIFACT_NAME }}.zip"
-        DOWNLOAD_URL=$(curl -s -X GET "${{ secrets.WORKER_API_URL }}/download?key=$FILE_KEY" | jq -r .downloadUrl)
-        echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> $GITHUB_ENV
-
+    # ========================
+    # Callback: finished
+    # ========================
     - name: 回调（结束）
       if: ${{ always() && inputs.callback_url != '' }}
       shell: bash
@@ -176,20 +210,24 @@ jobs:
         CALLBACK_URL: ${{ inputs.callback_url }}
       run: |
         set -euo pipefail
+
         case "${{ job.status }}" in
           success) STATUS="success" ;;
           failure) STATUS="failed" ;;
           cancelled) STATUS="cancelled" ;;
           *) STATUS="failed" ;;
         esac
+
         RUN_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
-        DOWNLOAD_URL="${{ env.DOWNLOAD_URL }}"
+        DOWNLOAD_URL="${DOWNLOAD_URL}"
+
         payload=$(jq -n \
           --arg status "$STATUS" \
           --arg run_url "$RUN_URL" \
           --arg download_url "$DOWNLOAD_URL" \
           '{status: $status, github_run_url: $run_url, download_url: $download_url}')
-        curl -sS -w "%{http_code}" \
+
+        curl -sS \
           -H "Content-Type: application/json" \
           -X POST "${CALLBACK_URL}" \
           --data "$payload" >/dev/null || true
