@@ -5,25 +5,23 @@ on:
     inputs:
       runs_on:
         required: false
-        default: 'ubuntu-latest'
+        default: ubuntu-latest
       repo_owner:
         required: true
       repo_name:
         required: true
       branch:
         required: true
-        default: 'main'
+        default: main
       commands:
         required: true
-        default: 'bun run build'
+        default: bun run build
       output_paths:
         required: true
-        default: 'dist'
-      env_vars:
-        required: false
+        default: dist
       callback_url:
         required: false
-        default: ''
+        default: ""
 
 permissions:
   contents: read
@@ -41,17 +39,17 @@ jobs:
 
     steps:
     # ========================
-    # Checkout workflow repo
+    # Checkout
     # ========================
     - name: 检出工作流仓库
       uses: actions/checkout@v4
 
     # ========================
-    # Record start time
+    # Start time
     # ========================
     - name: 记录开始时间
       run: |
-        echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+        echo "RUN_STARTED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
 
     # ========================
     # Toolchains
@@ -65,18 +63,14 @@ jobs:
       uses: dtolnay/rust-toolchain@stable
 
     # ========================
-    # Init environment
+    # Init env
     # ========================
     - name: 初始化工作环境
+      shell: bash
       run: |
         set -euo pipefail
-        if [[ "$OSTYPE" == "linux-gnu"* ]]; then
-          sudo apt-get -qq update 2>/dev/null || true
-          sudo apt-get -qq install -y jq zip >/dev/null 2>&1 || true
-        elif [[ "$OSTYPE" == "darwin"* ]]; then
-          command -v jq &>/dev/null || brew install jq >/dev/null 2>&1 || true
-          command -v zip &>/dev/null || brew install zip >/dev/null 2>&1 || true
-        fi
+        sudo apt-get -qq update || true
+        sudo apt-get -qq install -y jq zip || true
         bun add crypto-js child_process
 
     # ========================
@@ -87,11 +81,10 @@ jobs:
       env:
         CALLBACK_URL: ${{ inputs.callback_url }}
       run: |
-        URL=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
-        echo "::add-mask::${URL}"
+        set -euo pipefail
         curl -sS \
           -H "Content-Type: application/json" \
-          -X POST "${URL}" \
+          -X POST "${CALLBACK_URL}" \
           --data '{"status":"running"}' >/dev/null || true
 
     # ========================
@@ -108,13 +101,14 @@ jobs:
         git config --global user.name "GitHub Actions"
         git config --global user.email "actions@github.com"
 
-        GITLAB_BASE="${GITLAB_URL:-https://gitlab.com}"
-        GITLAB_USER="${GITLAB_USERNAME:-oauth2}"
-        GITLAB_PASS="${GITLAB_PASSWORD:-}"
-        GITLAB_HOST="${GITLAB_BASE#https://}"
+        BASE="${GITLAB_URL:-https://gitlab.com}"
+        USER="${GITLAB_USERNAME:-oauth2}"
+        PASS="${GITLAB_PASSWORD:-}"
+        HOST="${BASE#https://}"
 
-        REPO_URL="https://${GITLAB_USER}:${GITLAB_PASS}@${GITLAB_HOST}/${REPO_OWNER}/${REPO_NAME}.git"
-        git clone -q --branch "${BRANCH}" "${REPO_URL}" target-project
+        git clone -q --branch "${BRANCH}" \
+          "https://${USER}:${PASS}@${HOST}/${REPO_OWNER}/${REPO_NAME}.git" \
+          target-project
 
     # ========================
     # Install deps
@@ -164,14 +158,14 @@ jobs:
         echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
     # ========================
-    # Upload to R2 via Worker
+    # Upload via Worker proxy
     # ========================
     - name: 上传构建产物到 R2（Worker 代理）
+      working-directory: target-project
       shell: bash
       run: |
         set -euo pipefail
 
-        ZIP_FILE="${ZIP_FILE}"
         echo "Uploading ${ZIP_FILE} ..."
 
         RESPONSE=$(curl -sS -X POST "${WORKER_API_URL}/upload" \
@@ -194,6 +188,7 @@ jobs:
     - name: 构造下载地址
       shell: bash
       run: |
+        set -euo pipefail
         DOWNLOAD_URL="${WORKER_API_URL}/download?key=${ARTIFACT_KEY}"
         echo "DOWNLOAD_URL=$DOWNLOAD_URL" >> "$GITHUB_ENV"
 
@@ -219,7 +214,7 @@ jobs:
         esac
 
         RUN_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
-        DOWNLOAD_URL="${DOWNLOAD_URL}"
+        DOWNLOAD_URL="${DOWNLOAD_URL:-}"
 
         payload=$(jq -n \
           --arg status "$STATUS" \
