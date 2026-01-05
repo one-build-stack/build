@@ -151,7 +151,7 @@ jobs:
             printf '%s=%s\n' "$k" "$v" >> "$GITHUB_ENV"  # 设置环境变量
           fi
         done < "$TMP"
-        
+
         cp "$TMP" "$ENV_FILE"  # 将解密的环境变量存到 .env 文件
         rm -f "$TMP"  # 删除临时文件
 
@@ -168,56 +168,61 @@ jobs:
           cd "$BASE" && bun "$GITHUB_WORKSPACE/.github/workflows/run_interactive_command.ts" "$cmd" "$BASE"
         done
 
-    - name: 汇总输出
+    - name: 打包产物
       working-directory: target-project
       shell: bash
       run: |
         set -euo pipefail
         TS=$(date +"%Y%m%d-%H%M%S")
-        ZIP_NAME="build-$TS"
-        ZIP_FILE="$ZIP_NAME.zip"
+        ZIP_FILE="build-${TS}.zip"
 
         RAW=$(printf '%s' "${{ inputs.output_paths }}" | tr -d '\r')
         IFS=';' read -ra PATHS <<< "$RAW"
-        readarray -t PTHS < <(for p in "${PATHS[@]}"; do echo "$p" | xargs; done | sed '/^$/d')
-        if [ "${#PTHS[@]}" -eq 0 ]; then
-          echo "未提供有效输出路径" >&2
-          exit 1
-        fi
 
-        for p in "${PTHS[@]}"; do
-          if [ -d "$p" ]; then
-            (cd "$(dirname "$p")" && zip -r "$OLDPWD/$ZIP_FILE" "$(basename "$p")" >/dev/null)
-          elif [ -f "$p" ]; then
-            zip -j "$ZIP_FILE" "$p" >/dev/null 2>/dev/null || zip "$ZIP_FILE" "$p" >/dev/null
+        for p in "${PATHS[@]}"; do
+          # 启用 glob 展开
+          shopt -s nullglob
+          expanded=($p)
+          shopt -u nullglob
+
+          # 如果没有匹配项，使用原路径
+          if [ ${#expanded[@]} -eq 0 ]; then
+            expanded=("$p")
           fi
+
+          for item in "${expanded[@]}"; do
+            if [ -d "$item" ]; then
+              (cd "$(dirname "$item")" && zip -r "$OLDPWD/$ZIP_FILE" "$(basename "$item")" >/dev/null)
+            elif [ -f "$item" ]; then
+              zip -j "$ZIP_FILE" "$item" >/dev/null
+            fi
+          done
         done
 
-        if command -v stat >/dev/null 2>&1; then
-          SIZE=$(stat -c%s "$ZIP_FILE" 2>/dev/null || stat -f%z "$ZIP_FILE" 2>/dev/null || wc -c <"$ZIP_FILE")
-        else
-          SIZE=$(wc -c <"$ZIP_FILE")
-        fi
-        echo "ARTIFACT_NAME=$ZIP_NAME" >> $GITHUB_ENV
-        echo "ARTIFACT_PATH=$ZIP_FILE" >> $GITHUB_ENV
-        echo "ARTIFACT_SIZE=$SIZE" >> $GITHUB_ENV
+        echo "ZIP_FILE=$ZIP_FILE" >> "$GITHUB_ENV"
 
-    - name: 上传产物
-      id: upload_art
-      uses: actions/upload-artifact@v4
-      with:
-        name: ${{ env.ARTIFACT_NAME }}
-        path: target-project/${{ env.ARTIFACT_PATH }}
-        if-no-files-found: error
+    - name: 上传到 R2（Worker 代理）
+      working-directory: target-project
+      shell: bash
+      run: |
+        set -euo pipefail
 
-    - name: 回调
+        RESPONSE=$(curl -sS -X POST "${WORKER_API_URL}/upload" \
+          -F "file=@${ZIP_FILE}")
+
+        KEY=$(echo "$RESPONSE" | jq -r '.key')
+        [ -z "$KEY" ] || [ "$KEY" = "null" ] && exit 1
+
+        echo "ARTIFACT_KEY=$KEY" >> "$GITHUB_ENV"
+
+    - name: 回调（finished）
       if: ${{ always() && inputs.callback_url != '' }}
       shell: bash
       env:
+        CALLBACK_URL: ${{ inputs.callback_url }}
         OWNER: ${{ github.repository_owner }}
         REPO: ${{ github.event.repository.name }}
         RUN_ID: ${{ github.run_id }}
-        CALLBACK_URL: ${{ inputs.callback_url }}
       run: |
         set -euo pipefail
 
@@ -225,22 +230,26 @@ jobs:
           success) STATUS="success" ;;
           failure) STATUS="failed" ;;
           cancelled) STATUS="cancelled" ;;
-          *) STATUS="failed" ;;
         esac
 
         RUN_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}"
-        ART_ID="${{ steps.upload_art.outputs.artifact-id }}"
-        ART_URL="${{ steps.upload_art.outputs.artifact-url }}"
 
         DOWNLOAD_URL=""
-        [ -n "$ART_ID" ] && DOWNLOAD_URL="https://github.com/${OWNER}/${REPO}/actions/runs/${RUN_ID}/artifacts/${ART_ID}"
+        ARCHIVE_URL=""
+        ARTIFACT_SIZE=0
+
+        if [ -n "${ARTIFACT_KEY:-}" ]; then
+          DOWNLOAD_URL="${WORKER_API_URL}/download?key=${ARTIFACT_KEY}"
+          ARCHIVE_URL="$DOWNLOAD_URL"
+          ARTIFACT_SIZE=$(stat -c%s "target-project/${ZIP_FILE}" 2>/dev/null || stat -f%z "target-project/${ZIP_FILE}")
+        fi
 
         artifacts=$(jq -n \
-          --arg id "${ART_ID:-0}" \
-          --arg name "${{ env.ARTIFACT_NAME }}" \
-          --arg size "${{ env.ARTIFACT_SIZE }}" \
-          --arg arch "${ART_URL:-}" \
-          --arg down "${DOWNLOAD_URL}" \
+          --arg id "0" \
+          --arg name "${ZIP_FILE:-}" \
+          --arg size "$ARTIFACT_SIZE" \
+          --arg arch "$ARCHIVE_URL" \
+          --arg down "$DOWNLOAD_URL" \
           '[{
             id: ($id|tonumber),
             name: $name,
@@ -249,17 +258,16 @@ jobs:
             download_url: $down
           }]')
 
-        CB=$(printf '%s' "${CALLBACK_URL}" | tr -d '\r')
-        echo "::add-mask::${CB}"
-
         payload=$(jq -n \
           --arg status "$STATUS" \
           --arg run_url "$RUN_URL" \
           --argjson artifacts "$artifacts" \
-          '{status: $status, github_run_url: $run_url, artifacts: $artifacts}')
+          '{
+            status: $status,
+            github_run_url: $run_url,
+            artifacts: $artifacts
+          }')
 
-        curl -sS -w "%{http_code}" \
-          -H "Content-Type: application/json" \
-          -X POST "${CB}" \
+        curl -sS -H "Content-Type: application/json" \
+          -X POST "$CALLBACK_URL" \
           --data "$payload" >/dev/null || true
-
